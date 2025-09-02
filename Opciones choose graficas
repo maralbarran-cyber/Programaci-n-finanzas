@@ -1,0 +1,91 @@
+# -*- coding: utf-8 -*-
+"""
+Valuación de opción chooser (Monte Carlo) + Gráfico del perfil de pago al vencimiento
+"""
+
+import numpy as np
+from dataclasses import dataclass
+from typing import Tuple
+import matplotlib.pyplot as plt
+from math import log, sqrt, exp
+from scipy.stats import norm
+
+# =========================
+# Fórmulas Black-Scholes
+# =========================
+def bs_call_put(S, K, r, q, sigma, T):
+    if T <= 0:
+        return max(S - K, 0.0), max(K - S, 0.0)
+    d1 = (log(S / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * sqrt(T))
+    d2 = d1 - sigma * sqrt(T)
+    call = S * exp(-q * T) * norm.cdf(d1) - K * exp(-r * T) * norm.cdf(d2)
+    put  = K * exp(-r * T) * norm.cdf(-d2) - S * exp(-q * T) * norm.cdf(-d1)
+    return call, put
+
+# =========================
+# Simulación GBM
+# =========================
+def simulate_S_tau(S0, r, q, sigma, tau, n_paths, seed=None):
+    if seed is not None:
+        np.random.seed(seed)
+    drift = (r - q - 0.5 * sigma**2) * tau
+    vol   = sigma * np.sqrt(tau)
+    Z = np.random.normal(size=n_paths)
+    return S0 * np.exp(drift + vol * Z)
+
+# =========================
+# Valuación chooser
+# =========================
+@dataclass
+class ChooserParams:
+    S0: float
+    K: float
+    r: float
+    q: float
+    sigma: float
+    T: float
+    tau: float
+
+def chooser_price_mc(p: ChooserParams, n_paths=100000, seed=42):
+    S_tau = simulate_S_tau(p.S0, p.r, p.q, p.sigma, p.tau, n_paths, seed=seed)
+    T_res = p.T - p.tau
+    call_tau, put_tau = [], []
+    for s in S_tau:
+        c, put = bs_call_put(s, p.K, p.r, p.q, p.sigma, T_res)
+        call_tau.append(c)
+        put_tau.append(put)
+    chooser_tau = np.maximum(call_tau, put_tau)
+    payoff0 = np.exp(-p.r * p.tau) * np.array(chooser_tau)
+    return payoff0.mean(), payoff0.std(ddof=1) / np.sqrt(n_paths)
+
+# =========================
+# Gráfica de perfiles de pago
+# =========================
+def plot_payoffs(K):
+    S_range = np.linspace(0.5*K, 1.5*K, 200)
+    call_payoff = np.maximum(S_range - K, 0)
+    put_payoff  = np.maximum(K - S_range, 0)
+    chooser_payoff = np.maximum(call_payoff, put_payoff)  # = |S-K|
+
+    plt.figure(figsize=(8,6))
+    plt.plot(S_range, call_payoff, label="Call payoff", linestyle="--")
+    plt.plot(S_range, put_payoff, label="Put payoff", linestyle="--")
+    plt.plot(S_range, chooser_payoff, label="Chooser payoff", linewidth=2, color="black")
+    plt.axvline(K, color="gray", linestyle=":")
+    plt.title("Perfiles de pago al vencimiento (T)")
+    plt.xlabel("Precio subyacente $S_T$")
+    plt.ylabel("Payoff")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+# =========================
+# Ejemplo
+# =========================
+if __name__ == "__main__":
+    params = ChooserParams(S0=100, K=100, r=0.05, q=0.0, sigma=0.2, T=1.0, tau=0.5)
+    price, err = chooser_price_mc(params, n_paths=200000, seed=123)
+    print(f"Precio MC ≈ {price:.4f} ± {err:.4f}")
+
+    # Graficar perfiles
+    plot_payoffs(params.K)
