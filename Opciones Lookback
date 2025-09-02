@@ -1,0 +1,179 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import norm
+
+# ------------------------- Utilidades ---------------------------------
+
+def simulate_gbm_paths(S0, r, sigma, T, n_steps, n_paths, antithetic=True, seed=None):
+    """
+    Simula caminos geométricos brownianos en discretización de tiempo uniforme.
+    Devuelve array (n_paths, n_steps+1)
+    """
+    if seed is not None:
+        np.random.seed(seed)
+    dt = T / n_steps
+    nudt = (r - 0.5 * sigma ** 2) * dt
+    sigsdt = sigma * np.sqrt(dt)
+    # número de simulaciones base (sin antithetic)
+    half = n_paths // 2 if antithetic else n_paths
+
+    Z = np.random.normal(size=(half, n_steps))
+    if antithetic:
+        Z = np.vstack([Z, -Z])
+    # Si n_paths es impar y antithetic=True, generamos un vector extra
+    if Z.shape[0] < n_paths:
+        extra = np.random.normal(size=(1, n_steps))
+        Z = np.vstack([Z, extra])
+
+    increments = nudt + sigsdt * Z
+    log_paths = np.cumsum(increments, axis=1)
+    log_paths = np.hstack([np.zeros((log_paths.shape[0], 1)), log_paths])
+    S = S0 * np.exp(log_paths)
+    return S
+
+# ------------------------- Payoffs -----------------------------------
+
+def payoff_fixed_strike_call(paths, K):
+    """Call lookback de strike fijo: payoff = max(S_max - K, 0)"""
+    S_max = paths.max(axis=1)
+    return np.maximum(S_max - K, 0.0)
+
+
+def payoff_floating_strike_call(paths):
+    """Floating-strike lookback call: payoff = S_T - min_t S_t"""
+    S_T = paths[:, -1]
+    S_min = paths.min(axis=1)
+    return np.maximum(S_T - S_min, 0.0)
+
+# ------------------- Black-Scholes formula (vanilla call) ------------
+
+def bs_call_price(S, K, r, sigma, T):
+    if T <= 0 or sigma <= 0:
+        return max(S - K, 0.0)
+    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+    return S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+
+# ------------------- Monte Carlo pricing routines ---------------------
+
+def mc_price(payoff_func, S0, K_or_none, r, sigma, T, n_steps, n_paths,
+             antithetic=True, control_variate=True, seed=None):
+    """
+    Precio por Monte Carlo con descuento.
+    Si control_variate=True, usamos como control la opción europea (call) si aplica.
+    payoff_func: función(paths) -> payoffs
+    K_or_none: strike o None si no aplica (p.ej. floating-strike)
+    """
+    paths = simulate_gbm_paths(S0, r, sigma, T, n_steps, n_paths,
+                               antithetic=antithetic, seed=seed)
+
+    payoffs = payoff_func(paths) if K_or_none is None else payoff_func(paths, K_or_none)
+    discounted = np.exp(-r * T) * payoffs
+    price_mc = discounted.mean()
+    stderr = discounted.std(ddof=1) / np.sqrt(len(discounted))
+
+    info = {
+        'price': price_mc,
+        'std_error': stderr,
+        'n_paths': len(discounted)
+    }
+
+    # Control variate: usar payoff de una opción Europea call (con mismo S0,K,T)
+    if control_variate and K_or_none is not None:
+        # Precio analítico de la call europea
+        C_analytic = bs_call_price(S0, K_or_none, r, sigma, T)
+        # Payoff observado de la call europea (S_T - K)^+
+        S_T = paths[:, -1]
+        call_payoff = np.maximum(S_T - K_or_none, 0.0)
+        discounted_call = np.exp(-r * T) * call_payoff
+        cov = np.cov(discounted, discounted_call, ddof=1)[0, 1]
+        var_cv = discounted_call.var(ddof=1)
+        if var_cv > 0:
+            b_hat = cov / var_cv
+            adj_discounted = discounted - b_hat * (discounted_call - np.exp(-r*T) * C_analytic)
+            price_cv = adj_discounted.mean()
+            stderr_cv = adj_discounted.std(ddof=1) / np.sqrt(len(adj_discounted))
+            info.update({'price_cv': price_cv, 'std_error_cv': stderr_cv, 'b_hat': b_hat})
+
+    return info
+
+# ------------------- Funciones de visualización -----------------------
+
+def plot_payoff_hist(payoffs, title='Distribución del payoff (descontado)'):
+    plt.figure(figsize=(8,5))
+    plt.hist(payoffs, bins=50, alpha=0.8)
+    plt.title(title)
+    plt.xlabel('Payoff descontado')
+    plt.ylabel('Frecuencia')
+    plt.grid(True)
+    plt.show()
+
+
+def plot_convergence(estimates, true_value=None, title='Convergencia del estimador'):
+    plt.figure(figsize=(8,5))
+    x = np.arange(1, len(estimates) + 1)
+    plt.plot(x, estimates, label='Estimador MC')
+    if true_value is not None:
+        plt.hlines(true_value, 1, len(estimates), linestyles='dashed', label='Valor referencia')
+    plt.xlabel('Número de bloques')
+    plt.ylabel('Precio')
+    plt.title(title)
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+# ------------------- Ejemplo de uso ----------------------------------
+if __name__ == '__main__':
+    # Parámetros de mercado
+    S0 = 100.0
+    K = 95.0
+    r = 0.03
+    sigma = 0.25
+    T = 1.0
+
+    # Parámetros de simulación
+    n_steps = 252        # discretización diaria
+    n_paths = 20000      # número de caminos
+    seed = 2025
+
+    # 1) Fixed-strike lookback call
+    print('\n-- Fixed-strike lookback call (Monte Carlo) --')
+    info_fixed = mc_price(payoff_fixed_strike_call, S0, K, r, sigma, T, n_steps, n_paths,
+                          antithetic=True, control_variate=True, seed=seed)
+    print('Precio MC:', info_fixed['price'])
+    if 'price_cv' in info_fixed:
+        print('Precio MC (control variate):', info_fixed['price_cv'], 'b_hat=', info_fixed['b_hat'])
+    print('Std error:', info_fixed['std_error'])
+
+    # Graficar distribución del payoff descontado (fixed)
+    paths = simulate_gbm_paths(S0, r, sigma, T, n_steps, n_paths, antithetic=True, seed=seed)
+    payoffs_fixed = np.exp(-r*T) * payoff_fixed_strike_call(paths, K)
+    plot_payoff_hist(payoffs_fixed, title='Distribución payoff descontado - Fixed-strike Lookback Call')
+
+    # 2) Floating-strike lookback call
+    print('\n-- Floating-strike lookback call (Monte Carlo) --')
+    info_float = mc_price(payoff_floating_strike_call, S0, None, r, sigma, T, n_steps, n_paths,
+                          antithetic=True, control_variate=False, seed=seed)
+    print('Precio MC:', info_float['price'])
+    print('Std error:', info_float['std_error'])
+
+    # Graficar distribución del payoff descontado (floating)
+    payoffs_float = np.exp(-r*T) * payoff_floating_strike_call(paths)
+    plot_payoff_hist(payoffs_float, title='Distribución payoff descontado - Floating-strike Lookback Call')
+
+    # 3) Convergencia por bloques (ejemplo)
+    n_blocks = 50
+    block_size = n_paths // n_blocks
+    block_estimates = []
+    for i in range(n_blocks):
+        start = i * block_size
+        end = start + block_size
+        block_paths = paths[start:end, :]
+        block_payoff = np.exp(-r*T) * payoff_fixed_strike_call(block_paths, K)
+        block_estimates.append(block_payoff.mean())
+    cumulative = np.cumsum(block_estimates) / np.arange(1, n_blocks+1)
+    plot_convergence(cumulative, title='Convergencia estimador (fixed-strike)')
+
+    print('\nListo. Puedes modificar parámetros (n_paths, n_steps, sigma, etc.) y volver a ejecutar.')
+
+# Fin del notebook
