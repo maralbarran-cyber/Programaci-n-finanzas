@@ -1,0 +1,156 @@
+# -*- coding: utf-8 -*-
+"""
+Valuación de una opción exótica 'Chooser' bajo Black-Scholes mediante Monte Carlo.
+
+Definición (chooser simple):
+- Hoy (t=0) compras el derecho a "elegir" en una fecha τ (0 < τ < T) si el
+  derivado será un CALL o un PUT europeo, ambos con el mismo strike K y
+  vencimiento T. En τ observas S_τ y eliges el más valioso entre:
+    C_τ = BS_Call(S_τ, K, T-τ, r, q, σ)
+    P_τ = BS_Put (S_τ, K, T-τ, r, q, σ)
+- El valor hoy es:  E[ e^{-r τ} * max(C_τ, P_τ) ]  bajo la medida riesgo-neutral.
+
+Incluye:
+- Funciones Black-Scholes (call/put).
+- Simulación de S_τ (GBM riesgo-neutral) con antitéticos.
+- Valuación Monte Carlo con intervalos de confianza.
+- Ejemplo de uso y prueba de convergencia en N.
+"""
+
+import numpy as np
+from dataclasses import dataclass
+from typing import Tuple
+
+# =========================
+# Black-Scholes cerradas
+# =========================
+from math import log, sqrt, exp
+from scipy.stats import norm
+
+def bs_call_put(S: float, K: float, r: float, q: float, sigma: float, T: float) -> Tuple[float, float]:
+    """
+    Precios BS de un call y un put europeos con dividendos continuos q.
+    """
+    if T <= 0:
+        # Al vencimiento: payoffs
+        call = max(S - K, 0.0)
+        put  = max(K - S, 0.0)
+        return call, put
+
+    if sigma <= 0:
+        # Volatilidad cero: determinista
+        fwd = S * np.exp((r - q) * T)
+        disc = np.exp(-r * T)
+        call = disc * max(fwd - K, 0.0)
+        put  = disc * max(K - fwd, 0.0)
+        return call, put
+
+    d1 = (log(S / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * sqrt(T))
+    d2 = d1 - sigma * sqrt(T)
+    call = S * exp(-q * T) * norm.cdf(d1) - K * exp(-r * T) * norm.cdf(d2)
+    put  = K * exp(-r * T) * norm.cdf(-d2) - S * exp(-q * T) * norm.cdf(-d1)
+    return call, put
+
+# =========================
+# Simulación de S_tau
+# =========================
+def simulate_S_tau(S0: float, r: float, q: float, sigma: float, tau: float, n_paths: int, antithetic: bool=True, seed: int=None) -> np.ndarray:
+    """
+    Simula S_tau bajo GBM riesgo-neutral:
+    S_tau = S0 * exp( (r - q - 0.5 σ^2) τ + σ sqrt(τ) Z )
+    Con opción de variates antitéticos para reducir varianza.
+    """
+    if seed is not None:
+        np.random.seed(seed)
+    m = n_paths
+    if antithetic:
+        m = (n_paths + 1) // 2  # pares antitéticos
+    drift = (r - q - 0.5 * sigma**2) * tau
+    vol   = sigma * np.sqrt(tau)
+    Z = np.random.normal(size=m)
+    X = drift + vol * Z
+    S_pos = S0 * np.exp(X)
+    if antithetic:
+        X_anti = drift - vol * Z
+        S_neg = S0 * np.exp(X_anti)
+        S_tau_paths = np.concatenate([S_pos, S_neg], axis=0)[:n_paths]
+    else:
+        S_tau_paths = S_pos
+    return S_tau_paths
+
+# =========================
+# Valuación chooser por MC
+# =========================
+@dataclass
+class ChooserParams:
+    S0: float
+    K: float
+    r: float
+    q: float
+    sigma: float
+    T: float    # vencimiento final del derivado elegido
+    tau: float  # fecha de decisión (0 < tau < T)
+
+def chooser_price_mc(p: ChooserParams, n_paths: int=200_000, antithetic: bool=True, seed: int=42) -> Tuple[float, float]:
+    """
+    Valúa la opción chooser como E[exp(-r*tau) * max(C_tau, P_tau)].
+    Donde C_tau y P_tau son precios BS en τ con vencimiento residual (T - tau).
+    Devuelve (precio, error_std_del_estimador).
+    """
+    if not (0 < p.tau < p.T):
+        raise ValueError("Se requiere 0 < tau < T para una chooser estándar.")
+
+    # 1) Simular S_tau
+    S_tau_paths = simulate_S_tau(p.S0, p.r, p.q, p.sigma, p.tau, n_paths, antithetic=antithetic, seed=seed)
+
+    # 2) En τ, valuar call y put con vencimiento residual
+    T_res = p.T - p.tau
+    # Vectorizamos el BS en τ
+    # (para rendimiento, calculamos fórmula BS a mano en vector)
+    if T_res <= 0:
+        raise ValueError("T_res debe ser > 0 (T debe ser mayor que tau).")
+
+    # Componentes comunes
+    disc_tau = np.exp(-p.r * p.tau)
+    d1 = (np.log(S_tau_paths / p.K) + (p.r - p.q + 0.5 * p.sigma**2) * T_res) / (p.sigma * np.sqrt(T_res))
+    d2 = d1 - p.sigma * np.sqrt(T_res)
+    Nd1  = norm.cdf(d1)
+    Nd2  = norm.cdf(d2)
+    Nmd1 = norm.cdf(-d1)
+    Nmd2 = norm.cdf(-d2)
+
+    call_tau = S_tau_paths * np.exp(-p.q * T_res) * Nd1 - p.K * np.exp(-p.r * T_res) * Nd2
+    put_tau  = p.K * np.exp(-p.r * T_res) * Nmd2 - S_tau_paths * np.exp(-p.q * T_res) * Nmd1
+
+    # 3) Seleccionar el mayor y descontar a hoy
+    chooser_tau = np.maximum(call_tau, put_tau)
+    pay0 = disc_tau * chooser_tau
+
+    # 4) Estimador y error std (sigma_muestral / sqrt(n))
+    price = float(np.mean(pay0))
+    std_err = float(np.std(pay0, ddof=1) / np.sqrt(len(pay0)))
+    return price, std_err
+
+# =========================
+# Ejemplo de uso
+# =========================
+if __name__ == "__main__":
+    # Parámetros base
+    params = ChooserParams(
+        S0=100.0,   # spot
+        K=100.0,    # strike
+        r=0.05,     # tasa libre de riesgo
+        q=0.00,     # dividendo continuo
+        sigma=0.20, # vol
+        T=1.00,     # 1 año
+        tau=0.50    # decido a los 6 meses
+    )
+
+    for n in [50_000, 100_000, 200_000, 400_000]:
+        price, err = chooser_price_mc(params, n_paths=n, antithetic=True, seed=123)
+        print(f"N={n:>7,d}  Precio≈ {price:,.6f}   ±1σ≈ {err:,.6f}")
+
+    # (Opcional) Comparativa vs elegir hoy (tau→0) sólo para intuición:
+    # Si decidieras HOY, el valor sería max(call0, put0) (no es la chooser estándar).
+    call0, put0 = bs_call_put(params.S0, params.K, params.r, params.q, params.sigma, params.T)
+    print(f"\nPara referencia (no comparable 1:1): max(Call0, Put0) = {max(call0, put0):.6f}  |  Call0={call0:.6f}, Put0={put0:.6f}")
